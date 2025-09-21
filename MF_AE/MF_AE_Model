@@ -1,0 +1,587 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import numpy as np
+
+# -------------------------
+# Hybrid Laplacian Blur 필터
+# -------------------------
+class HybridLaplacianBlur(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        # Laplacian kernel
+        lap_kernel = torch.tensor([[-1, -1, -1],
+                                   [-1,  8, -1],
+                                   [-1, -1, -1]], dtype=torch.float32)
+        lap_kernel = lap_kernel.view(1, 1, 3, 3).repeat(3, 1, 1, 1)  # (3,1,3,3)
+        self.register_buffer('lap_kernel', lap_kernel)
+        
+        # Gaussian kernel (fixed 3x3, sigma=1)
+        gauss_kernel = self._create_gaussian_kernel(3, sigma=1.0)
+        gauss_kernel = gauss_kernel.view(1, 1, 3, 3).repeat(3, 1, 1, 1)  # (3,1,3,3)
+        self.register_buffer('gauss_kernel', gauss_kernel)
+    
+    def forward(self, x):
+        # x: (B, 3, H, W)
+        lap = F.conv2d(x, self.lap_kernel, padding=1, groups=3)  # Laplacian
+        blur = F.conv2d(lap, self.gauss_kernel, padding=1, groups=3)  # Gaussian Blur
+        hybrid = lap + blur
+        return hybrid
+    
+    def _create_gaussian_kernel(self, kernel_size=3, sigma=1.0):
+        """Generates a 2D Gaussian kernel."""
+        ax = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
+        xx, yy = torch.meshgrid(ax, ax, indexing="ij")
+        kernel = torch.exp(-(xx**2 + yy**2) / (2. * sigma**2))
+        kernel = kernel / torch.sum(kernel)
+        return kernel
+
+# -------------------------
+# DCT 필터 뱅크
+# -------------------------
+class DCTFilterBank(nn.Module):
+    def __init__(self, dct_size=(4, 4), threshold=8):
+        super().__init__()
+        self.dct_size = dct_size
+        self.threshold = threshold
+        
+        dct_kernels = self._create_dct_kernels()
+        dct_kernels_rgb = dct_kernels.unsqueeze(1).repeat(1, 3, 1, 1)
+        self.register_buffer('dct_kernels_rgb', dct_kernels_rgb)
+    
+    def _create_dct_kernels(self):
+        """4x4 DCT 필터 뱅크 생성"""
+        num_kernels = self.dct_size[0] * self.dct_size[1]
+        dct_kernels = torch.zeros(num_kernels, self.dct_size[0], self.dct_size[1], dtype=torch.float32)
+        
+        for i in range(self.dct_size[0]):
+            for j in range(self.dct_size[1]):
+                alpha_i = np.sqrt(1/self.dct_size[0]) if i == 0 else np.sqrt(2/self.dct_size[0])
+                alpha_j = np.sqrt(1/self.dct_size[1]) if j == 0 else np.sqrt(2/self.dct_size[1])
+                
+                x, y = np.mgrid[0:self.dct_size[0], 0:self.dct_size[1]]
+                kernel = alpha_i * alpha_j * np.cos((2*x + 1) * i * np.pi / (2*self.dct_size[0])) * \
+                         np.cos((2*y + 1) * j * np.pi / (2*self.dct_size[1]))
+                
+                dct_kernels[i * self.dct_size[1] + j] = torch.from_numpy(kernel.astype(np.float32))
+        
+        return dct_kernels
+    
+    def forward(self, x):
+        B, C, H, W = x.shape
+        
+        weight_for_conv = self.dct_kernels_rgb.view(-1, 1, 4, 4)
+        
+        dct_response = F.conv2d(x, weight_for_conv, padding=2, groups=C)
+        
+        # H, W 크기를 원래 512x512로 맞추기 위한 슬라이싱
+        # (513, 513) -> (512, 512)
+        dct_response = dct_response[:, :, :-1, :-1]
+        
+        # 48개 채널을 (16, 3)으로 나누고 평균을 내어 (B, 16, H, W)로 변환
+        dct_response = dct_response.view(B, 16, 3, H, W).mean(dim=2)
+        
+        # 절대값 및 임계값 적용
+        abs_response = torch.abs(dct_response)
+        
+        # 정규화 방식 수정: 논문에서 언급된 것처럼 clamp를 사용하여 안정화 [cite: 41, 46]
+        truncated_response = torch.clamp(abs_response, 0, self.threshold)
+        normalized_response = truncated_response / self.threshold
+            
+        return normalized_response
+
+# -------------------------
+# 스테가노그래피 검출용 이미지 필터링 모듈
+# -------------------------
+class SteganographyFilters(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        self.hybrid_laplacian = HybridLaplacianBlur()
+        
+        # DCT 필터 뱅크
+        self.dct_filter_bank = DCTFilterBank(dct_size=(4, 4), threshold=8)
+    
+    def forward(self, x):
+        B, C, H, W = x.shape
+        results = {}
+        
+        results['original'] = x
+        
+        hybrid_response = self.hybrid_laplacian(x)
+        hybrid_abs = torch.abs(hybrid_response)
+        results['hybrid'] = torch.clamp(hybrid_abs, 0, 1)
+        
+        dct_response = self.dct_filter_bank(x)
+        
+        # dct 응답의 16개 채널을 모두 사용하도록 수정
+        results['dct'] = dct_response
+        
+        return results
+
+# -------------------------
+# ResNet Basic Block 정의
+# -------------------------
+class ResNetBasicBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResNetBasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        # 잔여 연결을 위한 다운샘플링 레이어
+        self.downsample = None
+        if stride != 1 or in_channels != out_channels:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        identity = x
+        
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        if self.downsample is not None:
+            identity = self.downsample(identity)
+            
+        out += identity
+        out = self.relu(out)
+        
+        return out
+
+# -------------------------
+# 필터별 특화 ResNet 인코더 (풀링 제거)
+# -------------------------
+class SpecializedCNNEncoder(nn.Module):
+    def __init__(self, in_channels=3, out_channels=256, encoder_type='original'):
+        super().__init__()
+        self.encoder_type = encoder_type
+        
+        # 512x512 -> 128x128 (4x 다운샘플링)
+        self.initial_layer = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False),  # 512->256
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1, bias=False),  # 256->128
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+        
+        if encoder_type == 'original':
+            self.encoder = self._build_original_resnet_encoder(64, out_channels)
+        elif encoder_type == 'hybrid':
+            self.encoder = self._build_hybrid_resnet_encoder(64, out_channels)
+        elif encoder_type == 'dct':
+            # DCT용 initial_layer 재정의
+            self.initial_layer = nn.Sequential(
+                nn.Conv2d(16, 64, kernel_size=7, stride=2, padding=3, bias=False),  # 512->256
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1, bias=False),  # 256->128
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True)
+            )
+            self.encoder = self._build_dct_resnet_encoder(64, out_channels)
+            
+    def _build_original_resnet_encoder(self, in_channels, out_channels):
+        """128x128 -> 8x8로 크기 줄이기 (16x 다운샘플링)"""
+        return nn.Sequential(
+            # 128x128 -> 64x64
+            self._make_layer(ResNetBasicBlock, in_channels, 128, 2, stride=2),
+            # 64x64 -> 32x32
+            self._make_layer(ResNetBasicBlock, 128, 256, 2, stride=2),
+            # 32x32 -> 16x16
+            self._make_layer(ResNetBasicBlock, 256, out_channels, 2, stride=2),
+            # 16x16 -> 8x8
+            self._make_layer(ResNetBasicBlock, out_channels, out_channels, 2, stride=2),
+        )
+        
+    def _build_hybrid_resnet_encoder(self, in_channels, out_channels):
+        """128x128 -> 8x8로 크기 줄이기"""
+        return nn.Sequential(
+            # 128x128 -> 64x64
+            self._make_layer(ResNetBasicBlock, in_channels, 128, 2, stride=2),
+            # 64x64 -> 32x32
+            self._make_layer(ResNetBasicBlock, 128, 256, 2, stride=2), 
+            # 32x32 -> 16x16
+            self._make_layer(ResNetBasicBlock, 256, out_channels, 2, stride=2),
+            # 16x16 -> 8x8
+            self._make_layer(ResNetBasicBlock, out_channels, out_channels, 2, stride=2),
+        )
+        
+    def _build_dct_resnet_encoder(self, in_channels, out_channels):
+        """128x128 -> 8x8로 크기 줄이기"""
+        return nn.Sequential(
+            # 128x128 -> 64x64
+            self._make_layer(ResNetBasicBlock, in_channels, 128, 2, stride=2),
+            # 64x64 -> 32x32
+            self._make_layer(ResNetBasicBlock, 128, 256, 2, stride=2),
+            # 32x32 -> 16x16
+            self._make_layer(ResNetBasicBlock, 256, out_channels, 2, stride=2),
+            # 16x16 -> 8x8
+            self._make_layer(ResNetBasicBlock, out_channels, out_channels, 2, stride=2),
+        )
+
+    def _make_layer(self, block, in_channels, out_channels, blocks, stride=1):
+        layers = []
+        layers.append(block(in_channels, out_channels, stride))
+        for _ in range(1, blocks):
+            layers.append(block(out_channels, out_channels))
+        return nn.Sequential(*layers)
+        
+    def forward(self, x):
+        x = self.initial_layer(x)
+        x = self.encoder(x)
+        return x
+
+# -------------------------
+# 동적 임계값 손실 계산기
+# -------------------------
+class DynamicThresholdLossCalculator:
+    def __init__(self, hybrid_percentile=0.9, dct_percentile=0.5, min_threshold=0.05, max_threshold=0.8):
+        self.hybrid_percentile = hybrid_percentile
+        self.dct_percentile = dct_percentile
+        self.min_threshold = min_threshold
+        self.max_threshold = max_threshold
+    
+    def _compute_dynamic_threshold(self, response, percentile):
+        """배치별 응답 분포 기반 동적 임계값 계산"""
+        original_dtype = response.dtype
+        response_float = response.float()
+        
+        # 텐서 크기가 너무 커서 발생하는 오류 해결을 위해 샘플링 적용
+        response_flat = response_float.flatten()
+        
+        # 샘플링할 원소의 수를 설정 (전체 원소의 10% 또는 고정된 큰 수)
+        num_elements = response_flat.numel()
+        sample_size = min(int(num_elements * 0.1), 1000000) # 최대 100만 개 샘플링
+        
+        # 무작위 샘플링
+        if num_elements > sample_size:
+            indices = torch.randperm(num_elements, device=response_flat.device)[:sample_size]
+            response_sample = response_flat[indices]
+        else:
+            response_sample = response_flat
+        
+        # 샘플링된 텐서로 분위수 계산
+        threshold = torch.quantile(response_sample, percentile)
+        
+        # 최소/최대 임계값으로 클램핑
+        threshold = torch.clamp(threshold, self.min_threshold, self.max_threshold)
+        
+        return threshold.to(original_dtype)
+    
+    def compute_hybrid_loss(self, reconstructed, original, hybrid_response, weight=2.0):
+        hybrid_threshold = self._compute_dynamic_threshold(hybrid_response, self.hybrid_percentile)
+        hybrid_mask = (hybrid_response > hybrid_threshold).float()
+        
+        pixel_losses = (reconstructed - original) ** 2
+        weighted_losses = pixel_losses * hybrid_mask
+        
+        if hybrid_mask.sum() == 0:
+            return torch.tensor(0.0, device=reconstructed.device), hybrid_threshold.item()
+        
+        loss = weighted_losses.sum() / hybrid_mask.sum() * weight
+        return loss, hybrid_threshold.item()
+    
+    def compute_dct_loss(self, reconstructed, original, dct_response, weight=1.5):
+        """Dynamic threshold-based detail loss"""
+        dct_threshold = self._compute_dynamic_threshold(dct_response, self.dct_percentile)
+        dct_mask = (dct_response > dct_threshold).float()
+        
+        # Take the mean of the mask across the channel dimension
+        # This resolves the channel mismatch with pixel_losses
+        dct_mask_reduced = dct_mask.mean(dim=1, keepdim=True)
+        
+        pixel_losses = (reconstructed - original) ** 2
+        
+        # Multiply pixel_losses with the reduced mask
+        weighted_losses = pixel_losses * dct_mask_reduced
+        
+        # Prevent division by zero if the mask is empty
+        if dct_mask_reduced.sum() == 0:
+            return torch.tensor(0.0, device=reconstructed.device), dct_threshold.item()
+        
+        loss = weighted_losses.sum() / dct_mask_reduced.sum() * weight
+        return loss, dct_threshold.item()
+
+class MultiFilterDynamicLoss:
+    def __init__(self, hybrid_weight=1.0, dct_weight=10.0, base_mse_weight=1.0, 
+                 hybrid_percentile=0.9, dct_percentile=0.5):
+        self.calculator = DynamicThresholdLossCalculator(hybrid_percentile, dct_percentile)
+        self.hybrid_weight = hybrid_weight
+        self.dct_weight = dct_weight
+        self.base_mse_weight = base_mse_weight
+    
+    def compute_total_loss(self, reconstructed, original, filtered_results, attention_maps):
+        loss_dict = {}
+        
+        base_mse = F.mse_loss(reconstructed, original) * self.base_mse_weight
+        loss_dict['base_mse'] = base_mse.item()
+        
+        hybrid_loss, hybrid_threshold = self.calculator.compute_hybrid_loss(
+            reconstructed, original, filtered_results['hybrid'], self.hybrid_weight
+        )
+        loss_dict['hybrid'] = hybrid_loss.item()
+        loss_dict['hybrid_threshold'] = hybrid_threshold
+        
+        dct_loss, dct_threshold = self.calculator.compute_dct_loss(
+            reconstructed, original, filtered_results['dct'], self.dct_weight
+        )
+        loss_dict['dct'] = dct_loss.item()
+        loss_dict['dct_threshold'] = dct_threshold
+        
+        loss_dict['hybrid_max'] = filtered_results['hybrid'].max().item()
+        loss_dict['hybrid_mean'] = filtered_results['hybrid'].mean().item()
+        loss_dict['dct_max'] = filtered_results['dct'].max().item()
+        loss_dict['dct_mean'] = filtered_results['dct'].mean().item()
+        
+        total_loss = base_mse + hybrid_loss + dct_loss
+        loss_dict['total'] = total_loss.item()
+        
+        return total_loss, loss_dict
+
+# -------------------------
+# 어텐션 관련 모듈들
+# -------------------------
+class SimpleAttentionGenerator(nn.Module):
+    def __init__(self, feature_dim):
+        super().__init__()
+        self.hybrid_attention = nn.Sequential(
+            nn.Conv2d(feature_dim, feature_dim//4, 1),
+            nn.ReLU(),
+            nn.Conv2d(feature_dim//4, 1, 1),
+            nn.Sigmoid()
+        )
+        self.texture_attention = nn.Sequential(
+            nn.Conv2d(feature_dim, feature_dim//4, 1),
+            nn.ReLU(),
+            nn.Conv2d(feature_dim//4, 1, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, branch_features):
+        original_feat, hybrid_feat, dct_feat = branch_features
+        hybrid_attn = self.hybrid_attention(hybrid_feat)
+        texture_attn = self.texture_attention(dct_feat)
+        return [hybrid_attn, texture_attn]
+
+class AttentionGuidedFusion(nn.Module):
+    def __init__(self, feature_dim=256):
+        super().__init__()
+        
+        self.attention_generator = SimpleAttentionGenerator(feature_dim)
+        
+        self.original_enhancer = nn.Sequential(
+            nn.Conv2d(feature_dim, feature_dim, 3, 1, 1),
+            nn.BatchNorm2d(feature_dim),
+            nn.ReLU(inplace=True),
+        )
+        
+        self.guidance_fusion = nn.Conv2d(2, 1, 1)
+        
+    def forward(self, branch_features):
+        original_feat = branch_features[0]
+        
+        attentions = self.attention_generator(branch_features)
+        attention_maps = {
+            'hybrid_attention': attentions[0],
+            'dct_attention': attentions[1]
+        }
+        
+        all_guidance_tensor = torch.cat(attentions, dim=1)
+        unified_attention = torch.sigmoid(self.guidance_fusion(all_guidance_tensor))
+        attention_maps['unified_attention'] = unified_attention
+        
+        enhanced_original = self.original_enhancer(original_feat)
+        guided_original = enhanced_original * (1 + 2.0 * unified_attention)
+        
+        return guided_original, attention_maps
+
+# -------------------------
+# ResNet Basic Block 정의 (디코더용)
+# -------------------------
+class ResNetUpsampleBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=2):
+        super(ResNetUpsampleBlock, self).__init__()
+        
+        self.upsample_conv1 = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=stride, stride=stride, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        self.upsample_identity = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=stride, stride=stride, bias=False)
+        self.bn_identity = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        identity = self.upsample_identity(x)
+        identity = self.bn_identity(identity)
+        
+        out = self.upsample_conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        out += identity
+        out = self.relu(out)
+        
+        return out
+
+# -------------------------
+# ResNet 기반 디코더
+# -------------------------
+class ResNetDecoder(nn.Module):
+    def __init__(self, feature_dim=256):
+        super().__init__()
+        
+        self.decoder = nn.Sequential(
+            # 8x8 -> 16x16
+            ResNetUpsampleBlock(feature_dim, 256, stride=2),
+            
+            # 16x16 -> 32x32
+            ResNetUpsampleBlock(256, 128, stride=2),
+            
+            # 32x32 -> 64x64
+            ResNetUpsampleBlock(128, 64, stride=2),
+            
+            # 64x64 -> 128x128
+            ResNetUpsampleBlock(64, 32, stride=2),
+            
+            # 128x128 -> 256x256
+            ResNetUpsampleBlock(32, 16, stride=2),
+            
+            # 256x256 -> 512x512
+            nn.ConvTranspose2d(16, 3, kernel_size=4, stride=2, padding=1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        return self.decoder(x)
+
+# -------------------------
+# 메인 모델 (변경 사항 적용)
+# -------------------------
+class MultiFilterAutoEncoder(nn.Module):
+    def __init__(self, feature_dim=256):
+        super().__init__()
+        
+        self.filters = SteganographyFilters()
+        self.loss_calculator = MultiFilterDynamicLoss()
+        
+        # 브랜치별 특화 인코더 (3개 브랜치)
+        self.original_encoder = SpecializedCNNEncoder(3, feature_dim, encoder_type='original')
+        self.hybrid_encoder = SpecializedCNNEncoder(3, feature_dim, encoder_type='hybrid')
+        # DCT 입력 채널을 16으로 변경
+        self.dct_encoder = SpecializedCNNEncoder(16, feature_dim, encoder_type='dct')
+        
+        self.attention_fusion = AttentionGuidedFusion(feature_dim)
+        
+        self.decoder = ResNetDecoder(feature_dim)
+        
+    def compute_specialization_loss(self, branch_features, filtered_results, original, reconstructed):
+        """각 브랜치가 해당 필터의 특징을 잘 학습하도록 하는 특화 손실"""
+        spec_losses = {}
+
+        # Original 브랜치: 전반적인 재구성 능력
+        original_loss = F.mse_loss(reconstructed, original)
+        spec_losses['original_spec'] = original_loss.item()
+
+        # hybrid 브랜치: 엣지 중심 재구성 능력
+        hybrid_importance = self._compute_hybrid_importance(filtered_results['hybrid'])
+        # hybrid_importance는 이미 3채널이므로 문제 없음
+        hybrid_loss = F.mse_loss(reconstructed * hybrid_importance, original * hybrid_importance) * 1.5
+        spec_losses['hybrid_spec'] = hybrid_loss.item()
+
+        # dct 브랜치: 텍스처 재구성 능력
+        texture_importance = self._compute_texture_importance(filtered_results['dct'])
+        # dct_importance의 채널(16)과 reconstructed의 채널(3)을 맞추기 위해 평균을 사용
+        texture_importance_reduced = texture_importance.mean(dim=1, keepdim=True)
+        dct_loss = F.mse_loss(reconstructed * texture_importance_reduced, original * texture_importance_reduced) * 1.3
+        spec_losses['dct_spec'] = dct_loss.item()
+
+        total_spec_loss = original_loss + hybrid_loss + dct_loss
+        spec_losses['total_specialization'] = total_spec_loss.item()
+
+        return total_spec_loss, spec_losses
+
+    def _compute_hybrid_importance(self, hybrid_response):
+        B = hybrid_response.shape[0]
+        
+        original_dtype = hybrid_response.dtype
+        hybrid_response_float = hybrid_response.float()
+        
+        hybrid_flat = hybrid_response_float.view(B, -1)
+        thresholds = torch.quantile(hybrid_flat, 0.7, dim=1, keepdim=True).view(B, 1, 1, 1)
+        normalized = hybrid_response_float / (thresholds + 1e-8)
+        importance = torch.sigmoid(3.0 * (normalized - 1.0))
+        
+        return importance.to(original_dtype)
+    
+    def _compute_texture_importance(self, dct_response):
+        B = dct_response.shape[0]
+        
+        original_dtype = dct_response.dtype
+        dct_response_float = dct_response.float()
+        
+        dct_flat = dct_response_float.view(B, -1)
+        thresholds = torch.quantile(dct_flat, 0.6, dim=1, keepdim=True).view(B, 1, 1, 1)
+        normalized = dct_response_float / (thresholds + 1e-8)
+        importance = torch.sigmoid(3.0 * (normalized - 1.0))
+        
+        return importance.to(original_dtype)
+        
+    def forward(self, x, compute_loss=False, return_dcts=False, include_specialization_loss=True):
+        B, C, H, W = x.shape
+        
+        filtered_results = self.filters(x)
+        original_feat = self.original_encoder(filtered_results['original'])
+        hybrid_feat = self.hybrid_encoder(filtered_results['hybrid'])
+        # DCT encoder의 입력 채널을 16으로 변경
+        dct_feat = self.dct_encoder(filtered_results['dct'])
+        branch_features = [original_feat, hybrid_feat, dct_feat]
+        
+        guided_feat, attention_maps = self.attention_fusion(branch_features)
+        
+        reconstructed = self.decoder(guided_feat)
+        
+        if return_dcts:
+            return {
+                'reconstructed': reconstructed,
+                'filtered_results': filtered_results,
+                'attention_maps': attention_maps,
+                'branch_features': [f.detach() for f in branch_features],
+                'guided_feat': guided_feat,
+            }
+        
+        if compute_loss:
+            total_loss, loss_dict = self.loss_calculator.compute_total_loss(
+                reconstructed, x, filtered_results, attention_maps
+            )
+            
+            if include_specialization_loss:
+                # reconstructed 인자를 추가
+                spec_loss, spec_loss_dict = self.compute_specialization_loss(
+                    branch_features, filtered_results, x, reconstructed
+                )
+                
+                total_loss = total_loss + 0.3 * spec_loss
+                loss_dict.update(spec_loss_dict)
+                loss_dict['total'] = total_loss.item()
+            
+            return total_loss, loss_dict
+        
+        return reconstructed

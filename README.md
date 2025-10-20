@@ -24,7 +24,7 @@ Link : https://www.kaggle.com/competitions/alaska2-image-steganalysis
 
 - 입력
 
-   RGB 이미지 (3, 256, 256)
+   RGB 이미지 (3, 256, 256 / 512 * 512 이미지를 resize)
 
 - 아키텍처
   
@@ -78,7 +78,7 @@ Link : https://www.kaggle.com/competitions/alaska2-image-steganalysis
 
    주요 특징:
   
-   균형잡힌 다중 알고리즘 학습 (알고리즘별 과적합 방지)
+   균형잡힌 다중 알고리즘 학습 (J-UNIWARD + J-MiPOD + UERD)
   
    차별적 복원 (Cover: 쉬움, Stego: 어려움)
   

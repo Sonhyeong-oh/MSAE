@@ -7,38 +7,83 @@
 
 ## 파일 안내
 
-## main_pretrain.py
-MAE 사전학습(pre-training) 진입점. 인자 파싱 → 데이터셋/분산설정 → 모델 생성 → 옵티마이저/LR 스케줄러 → engine_pretrain.train_one_epoch 호출 루프 형태. 
+1. MSCAE_RGBmodel.py - 모델 아키텍처
+   
+- 목적
 
-## engine_pretrain.py
-한 에폭의 마스킹+복원 학습 루프. 입력 이미지를 패치 단위로 무작위 마스킹 후, 인코더/디코더를 통해 복원하고 픽셀 L2(또는 유사) 재구성 손실을 계산/로깅합니다. 데이터로더에서 나온 배치를 받아 마스킹 생성 → 전방/역전파 → 미터 집계를 담당합니다. 
+모든 신경망 아키텍처 정의
 
-## models_mae.py
-MAE 모델 정의부.
+## MSCAE_RGB_CAE (사전 학습 모델)
 
-ViT 인코더(패치 임베딩+클래스 토큰+포지셔널 임베딩)
+- 입력
+  RGB 이미지 (3, 256, 256)
 
-랜덤 마스킹 로직(토큰을 섞어 keep/drop 인덱스 선택)
+- 아키텍처
+  
+다중 브랜치 SRM 필터링 → 90 채널 (4개 브랜치 × 22.5개 필터)
+다중 브랜치 인코더 (브랜치별 Stage1 + 공유 Stage2/3)
+복원을 위한 디코더
+차별적 복원을 위한 채널별 & 공간적 증폭
 
-작은 디코더(임베딩 차원 축소+별도 포지셔널 임베딩)로 마스킹된 패치 복원
+- 출력
+  
+복원된 이미지 + 잠재 표현
 
-forward에서 (1) 인코더로 가시 토큰만 처리 → (2) 디코더에서 가시+마스크 토큰 합쳐 복원 → (3) 재구성 손실 반환
-등의 로직이 들어 있습니다. 
+## StegaNetRGB (분류 모델)
 
-## models_vit.py
-기본 ViT 백본(DeiT 기반 수정본). 인코더 블록/멀티헤드 어텐션/MLP 등 표준 구성. MAE의 인코더가 이 구현을 활용합니다. 
+- 입력
+  
+RGB 이미지 (3, 256, 256)
 
-## main_finetune.py, engine_finetune.py
-사전학습된 MAE 인코더 위에 분류 헤드를 붙여 미세조정(fine-tuning) 하는 스크립트와 루프. ImageNet-1K 등에서의 분류 성능을 재현하는 코드입니다. 
+- 아키텍처
+  
+MSCAE_RGB_CAE로부터 인코더/디코더 상속
+공간적 분산 증폭: 높은 분산 영역(가장자리/텍스처) 강조
+하이브리드 분류기: 학습된 특징(2880) + 분산 증폭 오차 특징(90)
 
-## main_linprobe.py
-인코더를 고정(freeze) 하고 선형 분류기만 학습하는 Linear Probe 스크립트. (README/문서에서 안내) 
+- 출력
+  
+분류 로짓 [Cover, Stego]
 
-## util/
-분산 학습 유틸, 로깅, 평균계산 메터릭, 체크포인트/시드 고정 등 훈련 보일러플레이트 모음. 
+- SNRLoss (커스텀 손실 함수)
+  
+목적: 차별적 복원 강제 (Stego가 Cover보다 복원하기 어렵도록)
+수식: Loss = max(0, target_ratio - stego_error/cover_error)²
 
-## PRETRAIN.md, FINETUNE.md, README.md
-실행 커맨드, 체크포인트 다운로드, 재현 설정 등 사용 가이드. README에는 Colab 데모, 사전학습 가중치 링크, 벤치마크 표가 요약되어 있습니다. 
+- Recon Loss
 
-## submitit_*.py
-클러스터 환경에서 Submitit으로 잡 제출을 돕는 스크립트. (대규모 분산 학습 배치용)
+Cover의 복원 품질 유지
+주요 특징:
+균형잡힌 다중 알고리즘 학습 (알고리즘별 과적합 방지)
+차별적 복원 (Cover: 쉬움, Stego: 어려움)
+층화 train/val 분할 (알고리즘 균형 유지)
+사용법:
+python pretrain_RGBCAE.py \
+    --cover_dir /path/to/covers \
+    --jmipod_dir /path/to/JMiPOD \
+    --juniward_dir /path/to/JUNIWARD \
+    --uerd_dir /path/to/UERD \
+    --snr_weight 30.0 \
+    --recon_weight 3.0 \
+    --epochs 50
+출력: checkpoints_cae/cae_rgb_balanced_stage1.pth
+3. MSCAE_trainRGB.py - 2단계 파인튜닝
+목적: 인코더를 고정한 상태에서 분류기 학습 (전이 학습) 데이터셋: 사전 학습과 동일한 균형잡힌 다중 알고리즘 데이터셋 학습 전략:
+# 인코더/디코더 고정 (사전 학습된 지식)
+for param in model.encoder.parameters():
+    param.requires_grad = False
+
+# 분류기만 학습
+optimizer = AdamW(classifier_params, lr=1e-4)
+모델 구성:
+전체 파라미터: ~30M
+├─ 고정됨 (인코더/디코더): ~28.5M (95%)
+└─ 학습 가능 (분류기): ~1.5M (5%)
+손실 함수:
+# 분류 손실만 사용 (복원 손실 없음)
+loss = CrossEntropy(logits, labels)
+주요 특징:
+전이 학습 (사전 학습된 인코더 활용)
+균형잡힌 다중 알고리즘 검증
+실시간 복원 비율 모니터링 (Cover vs Stego)
+강건한 오차 특징을 위한 공간적 분산 증폭

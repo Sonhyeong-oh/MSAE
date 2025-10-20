@@ -1,9 +1,16 @@
 # Multi-Branch Stacked AutoEncoder for Steganalysis
 
-## 모델 흐름도
+# 모델 흐름도
 
 <img width="1919" height="624" alt="image" src="https://github.com/user-attachments/assets/dd98c618-7474-483f-b140-35c677be7d7c" />
 
+# 데이터
+
+ALASKA2 (JPG 스테가노그래피 데이터셋)
+
+Cover Image + Stego(J-UNIWARD, J-MiPOD, UERD) Image
+
+Link : https://www.kaggle.com/competitions/alaska2-image-steganalysis
 
 # 파일 안내
 

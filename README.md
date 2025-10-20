@@ -105,3 +105,8 @@ Link : https://www.kaggle.com/competitions/alaska2-image-steganalysis
    MSAE에 의해 재구성된 Cover Image와 Stego Image 차이 시각화 (임시)
 
 <img width="1800" height="1200" alt="mscae_analysis_3_00004" src="https://github.com/user-attachments/assets/ed4cd20b-3e2a-4691-bfbd-4dc0514d5e0f" />
+
+# Reference
+
+Shunquan Tan, Bin Li, "Stacked convolutional auto-encoders for steganalysis of digital images", APSIPA 2014
+https://ieeexplore.ieee.org/document/7041565

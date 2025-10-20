@@ -1,5 +1,5 @@
-# HR-Memory-ViT-AE
-디렉터리 & 파일 안내
+# Multi-Branch Stacked AutoEncoder for Steganalysis
+파일 안내
 
 ## main_pretrain.py
 MAE 사전학습(pre-training) 진입점. 인자 파싱 → 데이터셋/분산설정 → 모델 생성 → 옵티마이저/LR 스케줄러 → engine_pretrain.train_one_epoch 호출 루프 형태. 

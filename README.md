@@ -2,10 +2,10 @@
 
 ## 모델 흐름도
 
-<img width="1919" height="631" alt="image" src="https://github.com/user-attachments/assets/c03d37e6-8a2f-4343-9514-1535f6b71be5" />
+<img width="1919" height="624" alt="image" src="https://github.com/user-attachments/assets/dd98c618-7474-483f-b140-35c677be7d7c" />
 
 
-파일 안내
+## 파일 안내
 
 ## main_pretrain.py
 MAE 사전학습(pre-training) 진입점. 인자 파싱 → 데이터셋/분산설정 → 모델 생성 → 옵티마이저/LR 스케줄러 → engine_pretrain.train_one_epoch 호출 루프 형태. 

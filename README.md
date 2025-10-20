@@ -16,10 +16,6 @@ Link : https://www.kaggle.com/competitions/alaska2-image-steganalysis
 
 ## MSCAE_RGBmodel.py - 모델 아키텍처
    
-- 목적
-
-모든 신경망 아키텍처 정의
-
 1. MSCAE_RGB_CAE (사전 학습 모델)
 
 - 입력

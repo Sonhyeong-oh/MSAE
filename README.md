@@ -1,4 +1,10 @@
 # Multi-Branch Stacked AutoEncoder for Steganalysis
+
+## 모델 흐름도
+
+<img width="1919" height="631" alt="image" src="https://github.com/user-attachments/assets/c03d37e6-8a2f-4343-9514-1535f6b71be5" />
+
+
 파일 안내
 
 ## main_pretrain.py

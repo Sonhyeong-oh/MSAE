@@ -89,3 +89,19 @@ Link : https://www.kaggle.com/competitions/alaska2-image-steganalysis
 - 목적
 
    인코더를 고정한 상태에서 분류기 학습
+
+
+# 시각화
+
+1. SRM Filter
+
+   SRM 필터를 거친 Cover Image와 Stego Image의 픽셀 차이 시각화
+
+<img width="1200" height="1000" alt="difference_residuals" src="https://github.com/user-attachments/assets/f1409d8b-3872-40f0-baf5-c65ebfd60177" />
+
+
+2. MSAE 출력 시각화
+
+   MSAE에 의해 재구성된 Cover Image와 Stego Image 차이 시각화 (임시)
+
+<img width="1800" height="1200" alt="mscae_analysis_3_00004" src="https://github.com/user-attachments/assets/ed4cd20b-3e2a-4691-bfbd-4dc0514d5e0f" />

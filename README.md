@@ -26,7 +26,11 @@ Link : https://www.kaggle.com/competitions/alaska2-image-steganalysis
   
    다중 브랜치 SRM 필터링 → 90 채널 (30개 필터 X RGB 채널)
 
-   다중 브랜치 인코더 (브랜치별 Stage1 + 공유 Stage2/3)
+   다중 브랜치 인코더 (브랜치별 Stage1 + 공유 Stage2)
+
+   Stage3 = DualAttentionDecoder
+   - 어떤 필터가 스테가노그래피 탐지에 중요한지 결정
+   - 노이즈 삽입 의심 영역 탐지
 
    복원을 위한 디코더
 

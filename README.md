@@ -1,3 +1,5 @@
+<img src="https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=Python&logoColor=white"/>
+
 # Multi-Branch Stacked AutoEncoder for Steganalysis
 
 # 모델 흐름도
